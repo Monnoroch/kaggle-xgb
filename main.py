@@ -23,14 +23,18 @@ def load_params_boost(boost, boost_file):
 		boost.load_model(bytearray(f["model"].tobytes()))
 	return iteration, seed
 
-def predict_boost_model(model, data):
-	preds = model.predict(data, output_margin=True)
-	maxs = np.max(preds, axis=1)
-	maxs = np.repeat(maxs[:, np.newaxis], len(preds[0]), axis=1)
-	logits = np.exp(preds - maxs)
-	lsum = np.sum(logits, axis=1)
-	lsums = np.repeat(lsum[:, np.newaxis], len(logits[0]), axis=1) # for broadcasting
-	return logits / lsums
+def predict_boost_model(model, data, binary=True):
+	if not binary:
+		preds = model.predict(data, output_margin=True)
+		maxs = np.max(preds, axis=1)
+		maxs = np.repeat(maxs[:, np.newaxis], len(preds[0]), axis=1)
+		logits = np.exp(preds - maxs)
+		lsum = np.sum(logits, axis=1)
+		lsums = np.repeat(lsum[:, np.newaxis], len(logits[0]), axis=1) # for broadcasting
+		return logits / lsums
+	else:
+		preds = model.predict(data).reshape((-1, 1))
+		return np.concatenate([1.0 - preds, preds], axis=1)
 
 def shuffle(df, axis=0):
 	shuffled_df = df.copy()
@@ -44,22 +48,22 @@ def cross_entropy(preds, targets):
 		res -= np.log(v)
 	return res
 
-def transformBinaryCols( data ):
-   for col in data.columns:
-       vals = data[ col ].unique()
-       if( len( vals ) == 2 ):
-           if( type( vals[0] ) == type( vals[1] ) and 'int' in str( type( vals[0] ) ) ):
-               data[ col ].astype( 'bool', copy = False )
-
-def preprocess(data, args):
+def preprocess(data, test_data, args):
 	if args.del_features:
-		delete_features = [(22, 'ind_var2_0', [0]),(23, 'ind_var2', [0]),(57, 'ind_var27_0', [0]),(58, 'ind_var28_0', [0]),(59, 'ind_var28', [0]),(60, 'ind_var27', [0]),(81, 'ind_var41', [0]),(85, 'ind_var46_0', [0]),(86, 'ind_var46', [0]),(132, 'num_var27_0', [0]),(133, 'num_var28_0', [0]),(134, 'num_var28', [0]),(135, 'num_var27', [0]),(156, 'num_var41', [0]),(162, 'num_var46_0', [0]),(163, 'num_var46', [0]),(180, 'saldo_var28', [0]),(181, 'saldo_var27', [0]),(190, 'saldo_var41', [0]),(193, 'saldo_var46', [0]),(221, 'imp_amort_var18_hace3', [0]),(223, 'imp_amort_var34_hace3', [0]),(235, 'imp_reemb_var13_hace3', [0]),(239, 'imp_reemb_var33_hace3', [0]),(245, 'imp_trasp_var17_out_hace3', [0]),(249, 'imp_trasp_var33_out_hace3', [0]),(262, 'num_var2_0_ult1', [0]),(263, 'num_var2_ult1', [0]),(304, 'num_reemb_var13_hace3', [0]),(308, 'num_reemb_var33_hace3', [0]),(316, 'num_trasp_var17_out_hace3', [0]),(320, 'num_trasp_var33_out_hace3', [0]),(328, 'saldo_var2_ult1', [0]),(350, 'saldo_medio_var13_medio_hace3', [0])]
-		for _, name, _ in delete_features:
-			data.drop(labels=name, inplace=True, axis=1)
+		tmp = data.append(test_data)
+		col_to_drop = []
+		for col in tmp.columns:
+			if len(tmp[col].unique()) == 1:
+				col_to_drop.append(col)
+		data.drop(col_to_drop, inplace=True, axis=1)
 	if args.var3_nan:
 		data['var3_NaN'] = (data['var3'] == -999999)
 	if args.tr_bin:
-		transformBinaryCols(data)
+		for col in data.columns:
+			vals = data[col].unique()
+			if len(vals) == 2:
+				if type(vals[0]) == type(vals[1]) and 'int' in str(type(vals[0])):
+					data[col].astype('bool', copy=False)
 	if args.drop_id:
 		data.drop(labels="ID", axis=1, inplace=True)
 	if args.pca:
@@ -85,9 +89,11 @@ def main_train(args):
 	parser.add_argument("--threads", type=int, default=available_cpu_count(), help="number of threads")
 	parser.add_argument("--sample", type=float, nargs=2, default=[0.5, 0.5], help="subsampling settings (samples, features)")
 	parser.add_argument("--lambda", dest="plambda", type=float, default=1, help="lambda parameter for booster")
+	parser.add_argument("--eta", type=float, default=0.01, help="eta parameter for booster")
 	parser.add_argument("--depth", type=int, default=6, help="tree depth parameter for booster")
 	parser.add_argument("--auc", default=False, action="store_true", help="calc auc instead of logloss")
 	parser.add_argument("--no-sample", dest="no_sample", default=False, action="store_true", help="no sample")
+	parser.add_argument("--binary", default=False, action="store_true", help="binary classification")
 	preprocess_flags(parser)
 	args = parser.parse_args(args)
 	print(args)
@@ -115,8 +121,11 @@ def main_train(args):
 		"objective": "multi:softmax",
 		"eval_metric": "auc",
 		"num_class": 2,
-		"bst:eta": 0.01,
+		"bst:eta": args.eta,
 	}
+	if args.binary:
+		params["objective"] = "binary:logistic"
+		del(params["num_class"])
 
 	model = xgb.Booster(params)
 	iteration = 0
@@ -125,9 +134,10 @@ def main_train(args):
 		iteration, seed = load_params_boost(model, args.file)
 
 	train_data = pd.read_csv(args.data[0], header=0)
+	test_data = pd.read_csv(args.data[1], header=0)
+	preprocess(train_data, test_data, args)
 
 	train_data = train_data.sample(n=len(train_data), random_state=seed)
-	preprocess(train_data, args)
 
 	train_x = train_data.drop(labels="TARGET", axis=1)
 	train_y = train_data["TARGET"]
@@ -145,7 +155,7 @@ def main_train(args):
 	train_size = len(train_y)
 	if not args.no_sample:
 		data = xgb.DMatrix(val_x, label=val_y)
-		val_predictions = predict_boost_model(model, data)
+		val_predictions = predict_boost_model(model, data, args.binary)
 		if args.auc:
 			val_err = metrics.roc_auc_score(np.array(val_y), val_predictions[:, 1], average="weighted") * len(val_y)
 		else:
@@ -166,7 +176,15 @@ def main_train(args):
 	if iteration == 0:
 		model = None
 
-	for iteration in range(iteration + 1, iteration + 1 + args.iters):
+	max_iter = iteration + 1 + args.iters
+	eta_start = 0.01
+	eta_end = 0.001
+	b = np.log(eta_end / eta_start) / (max_iter - 1 - 1)
+	a = eta_start / np.exp(b)
+	eta = [a * np.exp(b * k) for k in range(1, max_iter)]
+
+
+	for iteration in range(iteration + 1, max_iter):
 		start_time = time.time()
 
 		data = xgb.DMatrix(train_x, label=train_y)
@@ -174,11 +192,11 @@ def main_train(args):
 			params=params,
 			dtrain=data,
 			num_boost_round=1,
-			learning_rates=[args.learning_rate],
+			learning_rates=[eta[iteration]],
 			verbose_eval=False,
 			xgb_model=model,
 		)
-		train_predictions = predict_boost_model(model, data)
+		train_predictions = predict_boost_model(model, data, args.binary)
 		if args.auc:
 			train_err = metrics.roc_auc_score(np.array(train_y), train_predictions[:, 1], average="weighted") * len(train_y)
 		else:
@@ -186,7 +204,7 @@ def main_train(args):
 
 		if not args.no_sample:
 			data = xgb.DMatrix(val_x, label=val_y)
-			val_predictions = predict_boost_model(model, data)
+			val_predictions = predict_boost_model(model, data, args.binary)
 			if args.auc:
 				val_err = metrics.roc_auc_score(np.array(val_y), val_predictions[:, 1], average="weighted") * len(val_y)
 			else:
@@ -215,9 +233,10 @@ def main_train(args):
 
 def main_test(args):
 	parser = argparse.ArgumentParser(description="Train a tree boost model.")
-	parser.add_argument("--data", required=True, help="dataset to train on")
+	parser.add_argument("--data", required=True, nargs=2, help="dataset to train on")
 	parser.add_argument("--file", required=True, help="three model file")
 	parser.add_argument("--out", required=True, help="output network file prefix")
+	parser.add_argument("--binary", default=False, action="store_true", help="binary classification")
 	preprocess_flags(parser)
 	args = parser.parse_args(args)
 	print(args)
@@ -226,11 +245,12 @@ def main_test(args):
 	if args.file and os.path.exists(args.file):
 		iteration, seed = load_params_boost(model, args.file)
 
-	test_data = pd.read_csv(args.data, header=0)
+	train_data = pd.read_csv(args.data[0], header=0)
+	test_data = pd.read_csv(args.data[1], header=0)
 	ids = test_data["ID"]
-	preprocess(test_data, args)
+	preprocess(train_data, test_data, args)
 
-	val_predictions = predict_boost_model(model, xgb.DMatrix(test_data))
+	val_predictions = predict_boost_model(model, xgb.DMatrix(test_data), args.binary)
 	answers = val_predictions[:, 1]
 	res = open(args.out, "w")
 	res.write("ID,TARGET\n")
@@ -240,26 +260,49 @@ def main_test(args):
 		n += 1
 	res.close()
 
-def main_tsne(args):
+def main_info(args):
 	parser = argparse.ArgumentParser(description="Train a tree boost model.")
+	parser.add_argument("--file", required=True, help="three model file")
+	parser.add_argument("--fmap", required=True, help="fmap file")
 	parser.add_argument("--data", required=True, nargs=2, help="dataset to train on")
-	parser.add_argument("--out", required=True, help="output network file prefix")
+	parser.add_argument("--img", required=True, help="image file")
 	preprocess_flags(parser)
 	args = parser.parse_args(args)
 	print(args)
 
 	train_data = pd.read_csv(args.data[0], header=0)
-	train_data.drop(labels="TARGET", axis=1, inplace=True)
 	test_data = pd.read_csv(args.data[1], header=0)
-	preprocess(test_data, args)
-	preprocess(train_data, args)
+	preprocess(train_data, test_data, args)
 
+	fmap = open(args.fmap, "w")
+	i = 0
+	for feat in list(train_data.columns):
+		fmap.write('{0}\t{1}\tq\n'.format(i, feat))
+		i = i + 1
+	fmap.close()
 
-	print(res.shape)
+	model = xgb.Booster()
+	if args.file and os.path.exists(args.file):
+		iteration, seed = load_params_boost(model, args.file)
+
+	import operator
+	importance = model.get_fscore(fmap=args.fmap)
+	importance = sorted(importance.items(), key=operator.itemgetter(1))
+
+	df = pd.DataFrame(importance, columns=['feature', 'fscore'])
+
+	df['fscore'] = df['fscore'] / df['fscore'].sum()
+
+	import matplotlib.pyplot as plt
+	plt.figure()
+	df.plot(kind='barh', x='feature', y='fscore', legend=False, figsize=(6, 60))
+	plt.title('XGBoost Feature Importance')
+	plt.xlabel('relative importance')
+	plt.savefig(args.img, dpi=100)
 
 if __name__ == '__main__':
 	(ModChooser("Deep learning tools.")
 		.add("train", main_train, "train network")
 		.add("test", main_test, "test boost")
-		.add("tsne", main_tsne, "tsne")
+		.add("info", main_info, "info")
 		.main())

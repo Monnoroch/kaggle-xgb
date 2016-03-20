@@ -176,15 +176,7 @@ def main_train(args):
 	if iteration == 0:
 		model = None
 
-	max_iter = iteration + 1 + args.iters
-	eta_start = 0.01
-	eta_end = 0.001
-	b = np.log(eta_end / eta_start) / (max_iter - 1 - 1)
-	a = eta_start / np.exp(b)
-	eta = [a * np.exp(b * k) for k in range(1, max_iter)]
-
-
-	for iteration in range(iteration + 1, max_iter):
+	for iteration in range(iteration + 1, iteration + 1 + args.iters):
 		start_time = time.time()
 
 		data = xgb.DMatrix(train_x, label=train_y)
@@ -192,7 +184,7 @@ def main_train(args):
 			params=params,
 			dtrain=data,
 			num_boost_round=1,
-			learning_rates=[eta[iteration]],
+			learning_rates=[args.learning_rate],
 			verbose_eval=False,
 			xgb_model=model,
 		)
